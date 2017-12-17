@@ -1,0 +1,190 @@
+#! /bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+runlevel=S
+prevlevel=N
+umask 022
+export PATH runlevel prevlevel
+
+#
+# Trap CTRL-C &c only in this shell so we can interrupt subprocesses.
+#
+trap ":" INT QUIT TSTP
+/bin/hostname FriendlyARM
+
+[ -d /dev ]  || mkdir -m 0755 /dev
+[ -d /root ] || mkdir -m 0700 /root
+[ -d /sys ]  || mkdir /sys
+[ -d /proc ] || mkdir /proc
+[ -d /run ]  || mkdir /run
+[ -d /tmp ]  || mkdir /tmp
+mkdir -p /var/lock
+
+/bin/mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
+/bin/mount -t proc -o nodev,noexec,nosuid proc /proc
+
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+
+# Some things don't work properly without /etc/mtab.
+ln -sf /proc/mounts /etc/mtab
+
+# Note that this only becomes /dev on the real filesystem if udev's scripts
+# are used; which they will be, but it's worth pointing out
+if ! mount -t devtmpfs -o mode=0755 udev /dev; then
+	echo "W: devtmpfs not available, falling back to tmpfs for /dev"
+	mount -t tmpfs -o mode=0755 udev /dev
+	[ -e /dev/console ] || mknod -m 0600 /dev/console c 5 1
+	[ -e /dev/null ] || mknod /dev/null c 1 3
+fi
+mkdir /dev/pts
+mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
+mount -t tmpfs -o "noexec,nosuid,size=10%,mode=0755" tmpfs /run
+
+cmdline=`cat /proc/cmdline`
+
+ROOT=none
+ROOTFLAGS=
+ROOTFSTYPE=
+NFSROOT=
+IP=
+INIT=/sbin/init
+
+for x in $cmdline ; do
+	case $x in
+	root=*)
+		ROOT=${x#root=}
+		;;
+	rootfstype=*)
+		ROOTFSTYPE="-t ${x#rootfstype=}"
+		;;
+	rootflags=*)
+		ROOTFLAGS="-o ${x#rootflags=}"
+		;;
+	init=*)
+		INIT=${x#init=}
+		;;
+	stopnow)
+		INITSH=Y
+		;;
+	nfsroot=*)
+		NFSROOT=${x#nfsroot=}
+		;;
+	ip=*)
+		IP=${x#ip=}
+		;;
+
+	esac
+done
+
+if [ ! -z $NFSROOT ] ; then
+	echo $NFSROOT | sed s/:/\ /g  > /dev/x ;  read sip dir < /dev/x
+	echo $IP | sed s/:/\ /g > /dev/x;  read cip sip2 gip netmask hostname device autoconf < /dev/x
+	rm /dev/x
+	#echo $sip $dir $cip $sip2 $gip $netmask $hostname $device $autoconf >/dev/console
+	mount -t nfs $NFSROOT /r -o nolock,proto=tcp
+	#[ -e /r/dev/console ] || exec /bin/sh
+
+elif [ ! -z $run_fs_image ] ; then
+	ROOTFSTYPE="-t ext3"
+	for i in 1 2 3 4 5 ; do
+	/bin/mount -n -o sync -o noatime -o nodiratime -t vfat /dev/mmcblk0p1 /sdcard && break
+	echo Waiting for SD Card... >/dev/console
+	sleep 1
+	done
+	/sbin/losetup /dev/loop0 /sdcard/$run_fs_image
+	/bin/mount $ROOTFSTYPE /dev/loop0 /r
+	mount -o move /sdcard /r/sdcard
+	#/sbin/losetup /dev/loop1 /r/sdcard/swap
+	#/sbin/swapon /dev/loop1
+
+elif [ x${ROOT:0:13} = "x/dev/mmcblk0p" ] ; then
+	for i in 1 2 3 4 5 ; do
+	/bin/mount -n $ROOTFLAGS -r $ROOTFSTYPE $ROOT /r && break
+	echo Waiting for SD Card... >/dev/console
+	sleep 1
+	done
+else
+	for i in 1 2 3 4 5 ; do
+	/bin/mount -n $ROOTFLAGS -r $ROOTFSTYPE $ROOT /r && break
+	echo Waiting for Root dev... >/dev/console
+	sleep 1
+	done
+fi
+
+if [ -f /r/etc/fs.resized ] ; then
+	/bin/mount -o remount,rw /r
+elif [ "x${ROOTFSTYPE:3:3}" = "xext" ] ; then
+	umount /r
+	echo Resizing rootfs $ROOT... >/dev/console
+	resize2fs $ROOT >/dev/console 2>&1
+	/bin/mount -n $ROOTFLAGS $ROOTFSTYPE $ROOT /r
+	touch /r/etc/fs.resized
+	sync
+fi
+
+ONE_WIRE_PROC=/proc/driver/one-wire-info
+ETC_BASE=/r/etc
+[ -d /r/system/etc ] && ETC_BASE=/r/system/etc
+[ -e $ETC_BASE/ts.detected ] && . $ETC_BASE/ts.detected
+[ -z $CHECK_1WIRE ] && CHECK_1WIRE=Y
+if [ $CHECK_1WIRE = "Y" -a -e $ONE_WIRE_PROC ] ; then
+	if read lcd_type fw_ver tail < $ONE_WIRE_PROC ; then
+		if [ x$lcd_type = "x0" -a x$fw_ver = "x0" ] ; then
+			TS_DEV=/dev/touchscreen
+		else
+			TS_DEV=/dev/touchscreen-1wire
+			echo "1Wire touchscreen OK" >/dev/console
+		fi
+		if [ -e $ETC_BASE/friendlyarm-ts-input.conf ]; then
+			sed "s:^\(TSLIB_TSDEVICE=\).*:\1$TS_DEV:g" $ETC_BASE/friendlyarm-ts-input.conf > $ETC_BASE/ts-autodetect.conf
+			mv $ETC_BASE/ts-autodetect.conf $ETC_BASE/friendlyarm-ts-input.conf -f
+			echo "CHECK_1WIRE=N" > $ETC_BASE/ts.detected
+			sync
+		fi
+	fi
+fi
+
+[ -e /r/etc/friendlyarm-ts-input.conf ] && . /r/etc/friendlyarm-ts-input.conf
+[ -e /r/system/etc/friendlyarm-ts-input.conf ] && . /r/system/etc/friendlyarm-ts-input.conf
+export TSLIB_TSDEVICE
+
+if [ x$INITSH = "xY" ]; then
+	exec /bin/sh </dev/console >/dev/console 2>&1
+fi
+
+if [ ! -d /r/dev ]; then
+	mkdir -p /r/dev
+fi
+if [ ! -c /r/dev/console ]; then
+	mknod /r/dev/console c 5 1
+	sync
+fi
+
+# Preserve information on old systems without /run on the rootfs
+if [ -d /r/run ]; then
+	mount -n -o move /run /r/run
+else
+	# The initramfs udev database must be migrated:
+	if [ -d /run/udev ] && [ ! -d /dev/.udev ]; then
+		mv /run/udev /dev/.udev
+	fi
+	# The initramfs debug info must be migrated:
+	if [ -d /run/initramfs ] && [ ! -d /dev/.initramfs ]; then
+		mv /run/initramfs /dev/.initramfs
+	fi
+	umount /run
+fi
+
+# Move virtual filesystems over to the real filesystem
+mount -n -o move /sys /r/sys
+mount -n -o move /proc /r/proc
+
+# move the /dev tmpfs to the rootfs
+mount -n -o move /dev /r/dev
+
+# create a temporary symlink to the final /dev for other initramfs scripts
+rm -rf /dev
+ln -s /r/dev /dev
+
+#umount /proc
+exec switch_root /r $INIT </r/dev/console >/r/dev/console 2>&1
